@@ -1,0 +1,34 @@
+graph LR
+    Client["test_client.py<br/>/ HTTP caller"]
+
+    subgraph Service[" "]
+        direction TB
+        API["FastAPI<br/>(server/api)"]
+        BW["Benchmark Worker<br/>(server/worker)"]
+        OW["Optimizer Worker<br/>(server/worker)"]
+    end
+
+    PG[("Postgres<br/>experiment, job,<br/>iteration, trial,<br/>agent_version,<br/>templates,<br/>task_queue")]
+    Min[("MinIO<br/>agent .py files,<br/>traces, transcripts,<br/>verifier outputs")]
+    E2B["E2B sandboxes<br/>(via harbor subprocess)"]
+    Anth["Anthropic API<br/>(Claude Agent SDK)"]
+
+    Client -- "HTTP" --> API
+    API -- "rows" --> PG
+    API -- "blobs" --> Min
+
+    PG -. "queue rows" .-> BW
+    PG -. "queue rows" .-> OW
+
+    BW -- "rows" --> PG
+    BW -- "blobs" --> Min
+    BW -- "harbor run" --> E2B
+
+    OW -- "rows" --> PG
+    OW -- "blobs" --> Min
+    OW -- "agentic LLM" --> Anth
+
+    classDef store fill:#fef3c7,stroke:#92400e,color:#000
+    classDef ext fill:#e0e7ff,stroke:#3730a3,color:#000
+    class PG,Min store
+    class E2B,Anth ext

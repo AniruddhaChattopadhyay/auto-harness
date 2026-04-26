@@ -1,29 +1,68 @@
 """
-core/queue.py — Postgres-backed task queue operations.
+core/queue.py — Task queue operations backed by the PGMQ Postgres extension.
 
-All functions are async and take an AsyncSession managed by the caller.
-The SELECT … FOR UPDATE SKIP LOCKED claim is done via raw SQL (text()) because
-SQLModel/SQLAlchemy ORM does not compose SKIP LOCKED cleanly across all
-backends, and raw SQL is the canonical pattern for this use case.
+PGMQ provides SKIP LOCKED + visibility timeout semantics natively, so this
+module is a thin wrapper that maps the application's ``task_type`` strings
+to PGMQ queue names and exposes the same enqueue / claim / mark_done /
+mark_failed surface the rest of the codebase already uses.
 
-Queue flow:
-  enqueue()      → INSERT pending row, returns id
-  claim_one()    → SELECT FOR UPDATE SKIP LOCKED → set running, return row
-  mark_done()    → set done + finished_at
-  mark_failed()  → if attempts >= max_attempts → dead_letter; else re-pend w/ backoff
-  sweep_stale()  → find running rows past timeout → re-pend or dead_letter
+Queue mapping:
+  benchmark.run      → pgmq queue "benchmark_run"
+  optimizer.propose  → pgmq queue "optimizer_propose"
+
+Why PGMQ instead of a hand-rolled table:
+  - Visibility timeout makes a separate stale-claim sweeper unnecessary.
+  - read_ct on each message gives us retry counting for free.
+  - All operations are SQL functions, so they compose with the caller's
+    transaction (enqueue lands atomically with the surrounding work).
 """
 
 from __future__ import annotations
 
 import datetime
 import json
+from dataclasses import dataclass
 from typing import Optional
 
+import structlog
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from core.models import TaskQueue
+log = structlog.get_logger(__name__)
+
+
+# ── Task type ↔ queue name mapping ────────────────────────────────────────────
+
+_TASK_TYPE_TO_QUEUE: dict[str, str] = {
+    "benchmark.run": "benchmark_run",
+    "optimizer.propose": "optimizer_propose",
+}
+
+DEFAULT_MAX_ATTEMPTS = 3
+
+
+def _queue_for(task_type: str) -> str:
+    try:
+        return _TASK_TYPE_TO_QUEUE[task_type]
+    except KeyError as exc:
+        raise ValueError(f"Unknown task_type: {task_type!r}") from exc
+
+
+# ── Public dataclass returned by claim_one ────────────────────────────────────
+
+
+@dataclass(slots=True)
+class ClaimedTask:
+    """A message claimed from PGMQ, ready to be handed to a handler."""
+
+    id: str           # PGMQ msg_id, stringified
+    task_type: str    # e.g. "benchmark.run"
+    payload: dict
+    attempts: int     # PGMQ read_ct (1 on first read)
+    max_attempts: int
+
+
+# ── Operations ────────────────────────────────────────────────────────────────
 
 
 async def enqueue(
@@ -33,229 +72,131 @@ async def enqueue(
     scheduled_for: Optional[datetime.datetime] = None,
 ) -> str:
     """
-    Insert a new task_queue row and return its id.
+    Send a message onto the queue corresponding to *task_type*.
 
-    Must be called inside a transaction managed by the caller (the session
-    will be committed / rolled back by the caller's context manager).
+    Runs inside the caller's transaction — the send commits/rolls back with
+    the rest of the unit of work.
+
+    Returns the PGMQ msg_id as a string.
     """
-    task = TaskQueue(
-        task_type=task_type,
-        payload=payload,
-        status="pending",
-        attempts=0,
-        scheduled_for=scheduled_for or datetime.datetime.now(datetime.timezone.utc),
+    queue = _queue_for(task_type)
+
+    delay_seconds = 0
+    if scheduled_for is not None:
+        now = datetime.datetime.now(datetime.timezone.utc)
+        delta = (scheduled_for - now).total_seconds()
+        if delta > 0:
+            delay_seconds = int(delta)
+
+    result = await session.execute(
+        text(
+            "SELECT pgmq.send(:q, CAST(:msg AS jsonb), CAST(:delay AS integer))"
+        ),
+        {"q": queue, "msg": json.dumps(payload), "delay": delay_seconds},
     )
-    session.add(task)
-    await session.flush()  # assign id without committing yet
-    return task.id
+    msg_id = result.scalar_one()
+    return str(msg_id)
 
 
 async def claim_one(
     session: AsyncSession,
-    task_type: Optional[str] = None,
-) -> Optional[TaskQueue]:
+    task_type: str,
+    visibility_timeout_seconds: int,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+) -> Optional[ClaimedTask]:
     """
-    Claim the next claimable pending task using SELECT … FOR UPDATE SKIP LOCKED.
+    Claim the next available message from the queue for *task_type*.
 
-    Args:
-        session:   Async DB session.
-        task_type: Optional filter — if provided, only claim tasks of this type
-                   (e.g. 'benchmark.run' or 'optimizer.propose').
+    Uses PGMQ's ``read``, which atomically returns the next visible message
+    and pushes its visibility timeout *visibility_timeout_seconds* into the
+    future. If processing crashes the message becomes visible again automatically.
 
-    Returns the TaskQueue row (already mutated to status='running') or None if
-    the queue has no eligible rows.
+    Returns None if the queue has no claimable messages right now.
     """
-    if task_type is not None:
-        sql = text(
-            """
-            SELECT id
-            FROM   task_queue
-            WHERE  status      = 'pending'
-              AND  scheduled_for <= now()
-              AND  task_type   = :task_type
-            ORDER  BY scheduled_for, created_at
-            FOR    UPDATE SKIP LOCKED
-            LIMIT  1
-            """
-        )
-        result = await session.execute(sql, {"task_type": task_type})
-    else:
-        sql = text(
-            """
-            SELECT id
-            FROM   task_queue
-            WHERE  status = 'pending'
-              AND  scheduled_for <= now()
-            ORDER  BY scheduled_for, created_at
-            FOR    UPDATE SKIP LOCKED
-            LIMIT  1
-            """
-        )
-        result = await session.execute(sql)
+    queue = _queue_for(task_type)
+
+    result = await session.execute(
+        text(
+            "SELECT msg_id, read_ct, message "
+            "FROM pgmq.read(:q, CAST(:vt AS integer), 1)"
+        ),
+        {"q": queue, "vt": visibility_timeout_seconds},
+    )
     row = result.fetchone()
     if row is None:
         return None
 
-    task_id: str = row[0]
+    msg_id, read_ct, message = row[0], row[1], row[2]
 
-    now = datetime.datetime.now(datetime.timezone.utc)
-    update_sql = text(
-        """
-        UPDATE task_queue
-        SET    status     = 'running',
-               claimed_at = :now,
-               attempts   = attempts + 1
-        WHERE  id = :id
-        """
+    # PGMQ stores the body as JSONB; asyncpg returns it as a dict already.
+    payload = message if isinstance(message, dict) else json.loads(message)
+
+    return ClaimedTask(
+        id=str(msg_id),
+        task_type=task_type,
+        payload=payload,
+        attempts=int(read_ct),
+        max_attempts=max_attempts,
     )
-    await session.execute(update_sql, {"now": now, "id": task_id})
-
-    # Reload the row so the caller gets the mutated object.
-    get_sql = text("SELECT * FROM task_queue WHERE id = :id")
-    result2 = await session.execute(get_sql, {"id": task_id})
-    raw = result2.mappings().one()
-
-    # Reconstruct a TaskQueue model from the raw mapping.
-    task = TaskQueue.model_validate(dict(raw))
-    return task
 
 
-async def mark_done(session: AsyncSession, task_id: str) -> None:
-    """Mark a running task as done."""
-    now = datetime.datetime.now(datetime.timezone.utc)
+async def mark_done(
+    session: AsyncSession,
+    task_type: str,
+    task_id: str,
+) -> None:
+    """Permanently remove a successfully processed message from its queue."""
+    queue = _queue_for(task_type)
     await session.execute(
-        text(
-            """
-            UPDATE task_queue
-            SET    status      = 'done',
-                   finished_at = :now
-            WHERE  id = :id
-            """
-        ),
-        {"now": now, "id": task_id},
+        text("SELECT pgmq.delete(:q, CAST(:id AS bigint))"),
+        {"q": queue, "id": int(task_id)},
     )
 
 
 async def mark_failed(
     session: AsyncSession,
+    task_type: str,
     task_id: str,
     error: str,
+    attempts: int,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     retry: bool = True,
 ) -> None:
     """
-    Mark a task as failed.
+    Handle a failed message.
 
-    If ``retry`` is False or ``attempts >= max_attempts``, the task goes to
-    ``dead_letter``.  Otherwise it is re-queued as ``pending`` with an
-    exponential backoff (30 s × attempts).
+    - If ``retry`` and ``attempts < max_attempts``: schedule a backoff by
+      pushing the message's visibility timeout out by ``30 * attempts`` seconds.
+      Once that window elapses the message becomes claimable again and PGMQ
+      will increment read_ct on the next read.
+    - Otherwise: archive the message (PGMQ moves it to its dead-letter
+      ``pgmq.a_<queue>`` archive table for inspection).
+
+    The *error* is logged by the caller; PGMQ does not store error text on
+    the message itself.
     """
-    now = datetime.datetime.now(datetime.timezone.utc)
+    queue = _queue_for(task_type)
 
-    # Fetch current attempts + max_attempts.
-    row = (
-        await session.execute(
-            text("SELECT attempts, max_attempts FROM task_queue WHERE id = :id"),
-            {"id": task_id},
+    if retry and attempts < max_attempts:
+        backoff_seconds = 30 * attempts
+        log.warning(
+            "queue.task_retry",
+            queue=queue, task_id=task_id, attempt=attempts,
+            backoff_seconds=backoff_seconds, error=error,
         )
-    ).fetchone()
-
-    if row is None:
-        return  # Task vanished — nothing to do.
-
-    attempts, max_attempts = row[0], row[1]
-
-    if not retry or attempts >= max_attempts:
         await session.execute(
             text(
-                """
-                UPDATE task_queue
-                SET    status      = 'dead_letter',
-                       last_error  = :error,
-                       finished_at = :now
-                WHERE  id = :id
-                """
+                "SELECT pgmq.set_vt(:q, CAST(:id AS bigint), "
+                "CAST(:vt AS integer))"
             ),
-            {"error": error, "now": now, "id": task_id},
+            {"q": queue, "id": int(task_id), "vt": backoff_seconds},
         )
     else:
-        backoff_seconds = 30 * attempts
-        scheduled_for = now + datetime.timedelta(seconds=backoff_seconds)
-        await session.execute(
-            text(
-                """
-                UPDATE task_queue
-                SET    status        = 'pending',
-                       last_error    = :error,
-                       scheduled_for = :scheduled_for,
-                       claimed_at    = NULL,
-                       claimed_by    = NULL
-                WHERE  id = :id
-                """
-            ),
-            {"error": error, "scheduled_for": scheduled_for, "id": task_id},
+        log.error(
+            "queue.task_dead_letter",
+            queue=queue, task_id=task_id, attempt=attempts, error=error,
         )
-
-
-async def sweep_stale(session: AsyncSession, timeout_seconds: int) -> int:
-    """
-    Find ``running`` rows whose ``claimed_at`` is older than *timeout_seconds*
-    and re-queue them (or move to ``dead_letter`` if max_attempts exhausted).
-
-    Returns the count of rows swept.
-    """
-    cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
-        seconds=timeout_seconds
-    )
-
-    # Find stale running rows.
-    stale_sql = text(
-        """
-        SELECT id, attempts, max_attempts
-        FROM   task_queue
-        WHERE  status     = 'running'
-          AND  claimed_at < :cutoff
-        FOR    UPDATE SKIP LOCKED
-        """
-    )
-    result = await session.execute(stale_sql, {"cutoff": cutoff})
-    rows = result.fetchall()
-
-    if not rows:
-        return 0
-
-    now = datetime.datetime.now(datetime.timezone.utc)
-    swept = 0
-    for (task_id, attempts, max_attempts) in rows:
-        if attempts >= max_attempts:
-            await session.execute(
-                text(
-                    """
-                    UPDATE task_queue
-                    SET    status      = 'dead_letter',
-                           last_error  = 'stale: timed out',
-                           finished_at = :now
-                    WHERE  id = :id
-                    """
-                ),
-                {"now": now, "id": task_id},
-            )
-        else:
-            backoff_seconds = 30 * attempts
-            scheduled_for = now + datetime.timedelta(seconds=backoff_seconds)
-            await session.execute(
-                text(
-                    """
-                    UPDATE task_queue
-                    SET    status        = 'pending',
-                           last_error    = 'stale: timed out',
-                           scheduled_for = :scheduled_for,
-                           claimed_at    = NULL,
-                           claimed_by    = NULL
-                    WHERE  id = :id
-                    """
-                ),
-                {"scheduled_for": scheduled_for, "id": task_id},
-            )
-        swept += 1
-
-    return swept
+        await session.execute(
+            text("SELECT pgmq.archive(:q, CAST(:id AS bigint))"),
+            {"q": queue, "id": int(task_id)},
+        )

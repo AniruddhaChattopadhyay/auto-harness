@@ -1,13 +1,14 @@
 services:
   postgres:
-    image: postgres:16-alpine
+    # PGMQ extension preinstalled. https://github.com/pgmq/pgmq
+    image: ghcr.io/pgmq/pg17-pgmq:v1.5.1
     restart: unless-stopped
     environment:
       POSTGRES_USER: harness
       POSTGRES_PASSWORD: harness
       POSTGRES_DB: harness
     ports:
-      - "5432:5432"
+      - "15433:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
@@ -24,8 +25,8 @@ services:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
     ports:
-      - "9000:9000"   # S3 API
-      - "9001:9001"   # web console
+      - "9100:9000"   # S3 API
+      - "9101:9001"   # web console
     volumes:
       - minio-data:/data
     healthcheck:

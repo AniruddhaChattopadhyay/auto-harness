@@ -1,0 +1,66 @@
+erDiagram
+    templates ||--o{ experiment : "default config"
+    experiment ||--o{ agent_version : "snapshots"
+    experiment ||--o{ job : "sessions"
+    experiment ||--o{ iteration : "history"
+    experiment }o--|| agent_version : "baseline / best pointer"
+    job ||--o{ iteration : "produced"
+    iteration ||--o{ trial : "per-task result"
+    iteration }o--|| agent_version : "ran"
+
+    templates {
+        text id PK
+        text instruction_template
+        text default_baseline_agent_uri
+        text_array default_task_ids
+        text_array default_test_task_ids
+        text default_optimizer_model
+        text default_optimizer_kind
+    }
+    experiment {
+        text id PK
+        text template_id FK
+        text_array task_ids
+        text_array test_task_ids
+        text optimizer_model
+        text optimizer_kind
+        text baseline_agent_version_id FK
+        text best_agent_version_id FK
+        numeric best_score
+        text status
+    }
+    agent_version {
+        text id PK
+        text experiment_id FK
+        int version_number
+        text source_uri "MinIO key"
+        text source_hash
+    }
+    job {
+        text id PK
+        text experiment_id FK
+        int max_iterations
+        jsonb stopping_criteria
+        text status
+        text stop_reason
+    }
+    iteration {
+        text id PK
+        text experiment_id FK
+        text job_id FK
+        int iteration_number
+        text agent_version_id FK
+        numeric score
+        text outcome "baseline_kept_reverted"
+        text optimizer_diagnosis
+        text optimizer_transcript_uri "MinIO"
+    }
+    trial {
+        text id PK
+        text iteration_id FK
+        text task_id
+        text status
+        numeric reward "null on infra error"
+        text trace_uri "MinIO"
+        text verifier_output_uri "MinIO"
+    }

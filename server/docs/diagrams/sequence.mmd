@@ -1,0 +1,47 @@
+sequenceDiagram
+    participant Client
+    participant API
+    participant DB as Postgres
+    participant Q as task_queue
+    participant BW as Benchmark Worker
+    participant OW as Optimizer Worker
+    participant E2B
+    participant Min as MinIO
+    participant SDK as Claude Agent SDK
+
+    Client->>API: POST /experiments
+    API->>Min: upload baseline_agent.py
+    API->>DB: insert experiment + agent_version v0
+    API-->>Client: 201 {experiment_id}
+
+    Client->>API: POST /experiments/{id}/jobs
+    API->>DB: insert job, iteration 0
+    API->>Q: enqueue benchmark.run(iter=0)
+    API-->>Client: 202 {job_id}
+
+    Client->>API: GET /jobs/{id} (poll)
+
+    BW->>Q: claim benchmark.run
+    BW->>Min: get agent.py
+    BW->>E2B: harbor run (N parallel sandboxes)
+    E2B-->>BW: rewards + traces + verifier output
+    BW->>Min: upload traces, verifier output
+    BW->>DB: insert trial rows<br/>iteration.status=done, score, outcome
+    BW->>DB: experiment.best_agent_version, best_score
+    BW->>Q: enqueue optimizer.propose(iter)
+
+    OW->>Q: claim optimizer.propose
+    OW->>DB: check stop conditions
+    alt continue
+        OW->>Min: pull agent.py, learnings.md, train traces (test held out)
+        OW->>SDK: query() with restricted tools
+        SDK-->>OW: edited agent.py, learnings.md, transcript
+        OW->>Min: upload new agent.py + transcript
+        OW->>DB: insert agent_version v(n+1), iteration n+1
+        OW->>Q: enqueue benchmark.run(iter=n+1)
+    else stop
+        OW->>DB: job.status=done, stop_reason
+    end
+
+    Client->>API: GET /experiments/{id}/iterations
+    API-->>Client: full iteration history

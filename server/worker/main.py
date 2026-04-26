@@ -1,10 +1,12 @@
 """
 worker/main.py — Queue consumer loop entry point.
 
-Runs an asyncio event loop with:
-  - One consumer coroutine for 'benchmark.run' tasks (concurrency limited).
-  - One consumer coroutine for 'optimizer.propose' tasks (concurrency limited).
-  - One sweeper coroutine that re-queues stale running tasks every 60 seconds.
+Runs an asyncio event loop with one consumer coroutine per task type
+(``benchmark.run`` and ``optimizer.propose``). Each consumer polls its PGMQ
+queue with ``pgmq.read``; the message becomes invisible for
+``worker_task_timeout_seconds`` while it's being processed and is
+auto-revived by PGMQ if the worker crashes — so no separate stale-claim
+sweeper is needed.
 
 Graceful shutdown on SIGTERM: cancel consumer coroutines, finish in-flight
 work, then dispose the DB engine.
@@ -20,7 +22,6 @@ from __future__ import annotations
 
 import asyncio
 import signal
-import sys
 
 import structlog
 
@@ -41,22 +42,32 @@ _HANDLERS = {
 }
 
 
-async def _process_one(task_type: str) -> bool:
+async def _process_one(task_type: str, visibility_timeout: int) -> bool:
     """
     Claim one task of *task_type*, dispatch it, mark done or failed.
 
     Returns True if a task was processed, False if the queue was empty.
     """
     async with get_session() as session:
-        task = await q.claim_one(session, task_type=task_type)
-        if task is None:
-            return False
-        # Commit the claim immediately so the row is visible as 'running'.
+        task = await q.claim_one(
+            session,
+            task_type=task_type,
+            visibility_timeout_seconds=visibility_timeout,
+        )
+        # Commit the read so PGMQ's vt update is visible to other workers.
         await session.commit()
+
+    if task is None:
+        return False
 
     task_id = task.id
     handler = _HANDLERS[task_type]
-    log.info("worker.task_claimed", task_id=task_id, task_type=task_type)
+    log.info(
+        "worker.task_claimed",
+        task_id=task_id,
+        task_type=task_type,
+        attempt=task.attempts,
+    )
 
     try:
         async with get_session() as session:
@@ -64,7 +75,7 @@ async def _process_one(task_type: str) -> bool:
             # session auto-commits on clean exit (see core/db.py).
 
         async with get_session() as session:
-            await q.mark_done(session, task_id)
+            await q.mark_done(session, task_type, task_id)
 
         log.info("worker.task_done", task_id=task_id, task_type=task_type)
 
@@ -73,11 +84,20 @@ async def _process_one(task_type: str) -> bool:
             "worker.task_failed",
             task_id=task_id,
             task_type=task_type,
+            attempt=task.attempts,
             exc=str(exc),
         )
         try:
             async with get_session() as session:
-                await q.mark_failed(session, task_id, error=str(exc), retry=True)
+                await q.mark_failed(
+                    session,
+                    task_type=task_type,
+                    task_id=task_id,
+                    error=str(exc),
+                    attempts=task.attempts,
+                    max_attempts=task.max_attempts,
+                    retry=True,
+                )
         except Exception:
             log.exception("worker.mark_failed_error", task_id=task_id)
 
@@ -87,7 +107,12 @@ async def _process_one(task_type: str) -> bool:
 # ── Consumer loops ────────────────────────────────────────────────────────────
 
 
-async def _consumer_loop(task_type: str, concurrency: int, poll_interval: float) -> None:
+async def _consumer_loop(
+    task_type: str,
+    concurrency: int,
+    poll_interval: float,
+    visibility_timeout: int,
+) -> None:
     """
     Run *concurrency* parallel workers consuming tasks of *task_type*.
 
@@ -99,13 +124,14 @@ async def _consumer_loop(task_type: str, concurrency: int, poll_interval: float)
         task_type=task_type,
         concurrency=concurrency,
         poll_interval=poll_interval,
+        visibility_timeout=visibility_timeout,
     )
     semaphore = asyncio.Semaphore(concurrency)
 
     async def _slot() -> None:
         while True:
             async with semaphore:
-                found = await _process_one(task_type)
+                found = await _process_one(task_type, visibility_timeout)
             if not found:
                 await asyncio.sleep(poll_interval)
 
@@ -119,41 +145,11 @@ async def _consumer_loop(task_type: str, concurrency: int, poll_interval: float)
         raise
 
 
-# ── Sweeper ───────────────────────────────────────────────────────────────────
-
-
-async def _sweeper_loop(timeout_seconds: int, sweep_interval: float = 60.0) -> None:
-    """
-    Periodically re-queue stale 'running' tasks whose worker has crashed.
-
-    Runs every *sweep_interval* seconds.  Stale = claimed_at older than
-    *timeout_seconds*.
-    """
-    log.info(
-        "worker.sweeper_start",
-        timeout_seconds=timeout_seconds,
-        sweep_interval=sweep_interval,
-    )
-    while True:
-        await asyncio.sleep(sweep_interval)
-        try:
-            async with get_session() as session:
-                swept = await q.sweep_stale(session, timeout_seconds)
-            if swept:
-                log.info("worker.sweep_done", swept=swept)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            log.exception("worker.sweep_error")
-
-
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 
 async def main() -> None:
     """Initialise and run the worker process."""
-    import structlog
-
     structlog.configure(
         processors=[
             structlog.stdlib.add_log_level,
@@ -193,6 +189,7 @@ async def main() -> None:
             task_type="benchmark.run",
             concurrency=settings.worker_benchmark_concurrency,
             poll_interval=settings.worker_poll_interval_seconds,
+            visibility_timeout=settings.worker_task_timeout_seconds,
         ),
         name="benchmark_consumer",
     )
@@ -201,24 +198,18 @@ async def main() -> None:
             task_type="optimizer.propose",
             concurrency=settings.worker_optimizer_concurrency,
             poll_interval=settings.worker_poll_interval_seconds,
+            visibility_timeout=settings.worker_task_timeout_seconds,
         ),
         name="optimizer_consumer",
     )
-    sweeper_task = asyncio.create_task(
-        _sweeper_loop(
-            timeout_seconds=settings.worker_task_timeout_seconds,
-        ),
-        name="sweeper",
-    )
 
-    # Wait until SIGTERM/SIGINT.
     await shutdown_event.wait()
 
     log.info("worker.shutting_down")
-    for task in (benchmark_task, optimizer_task, sweeper_task):
+    for task in (benchmark_task, optimizer_task):
         task.cancel()
 
-    await asyncio.gather(benchmark_task, optimizer_task, sweeper_task, return_exceptions=True)
+    await asyncio.gather(benchmark_task, optimizer_task, return_exceptions=True)
 
     await dispose_engine()
     log.info("worker.stopped")

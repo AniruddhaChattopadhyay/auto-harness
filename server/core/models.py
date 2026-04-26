@@ -458,71 +458,8 @@ class Trial(SQLModel, table=True):
     )
 
 
-# ── Table: task_queue ─────────────────────────────────────────────────────────
-
-
-class TaskQueue(SQLModel, table=True):
-    """
-    Postgres-backed task queue consumed via SELECT … FOR UPDATE SKIP LOCKED.
-    Two task types: ``benchmark.run`` and ``optimizer.propose``.
-    See design.md §5.11, §6.6.
-    """
-
-    __tablename__ = "task_queue"
-    __table_args__ = (
-        CheckConstraint(
-            "task_type IN ('benchmark.run','optimizer.propose')",
-            name="ck_task_queue_task_type",
-        ),
-        CheckConstraint(
-            "status IN ('pending','running','done','failed','dead_letter')",
-            name="ck_task_queue_status",
-        ),
-        # Partial index: fast claim scan over pending rows only.
-        Index(
-            "task_queue_pending",
-            "scheduled_for",
-            postgresql_where=sa.text("status = 'pending'"),
-        ),
-    )
-
-    id: str = Field(
-        default_factory=_new_ulid,
-        primary_key=True,
-    )
-    task_type: str = Field(nullable=False)
-    payload: dict = Field(
-        sa_column=Column(JSONB, nullable=False),
-    )
-    status: str = Field(default="pending", nullable=False)
-    attempts: int = Field(default=0, nullable=False)
-    max_attempts: int = Field(default=3, nullable=False)
-    scheduled_for: datetime = Field(
-        default_factory=datetime.utcnow,
-        sa_column=Column(
-            sa.DateTime(timezone=True),
-            nullable=False,
-            server_default=sa.text("now()"),
-        ),
-    )
-    claimed_by: Optional[str] = Field(default=None, nullable=True)
-    claimed_at: Optional[datetime] = Field(
-        default=None,
-        sa_column=Column(sa.DateTime(timezone=True), nullable=True),
-    )
-    finished_at: Optional[datetime] = Field(
-        default=None,
-        sa_column=Column(sa.DateTime(timezone=True), nullable=True),
-    )
-    last_error: Optional[str] = Field(default=None, nullable=True)
-    created_at: datetime = Field(
-        default_factory=datetime.utcnow,
-        sa_column=Column(
-            sa.DateTime(timezone=True),
-            nullable=False,
-            server_default=sa.text("now()"),
-        ),
-    )
+# Task queue lives in the PGMQ extension (see core/queue.py and the
+# pgmq_queues migration); no SQLModel is needed here.
 
 
 # ── Public re-exports ──────────────────────────────────────────────────────────
@@ -536,7 +473,6 @@ __all__ = [
     "Job",
     "Iteration",
     "Trial",
-    "TaskQueue",
     "SQLModel",
 ]
 
