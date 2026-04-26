@@ -1,0 +1,39 @@
+# Virtualenv
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+build/
+dist/
+
+# Local env
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+
+# Local data
+data/
+postgres-data/
+minio-data/
+
+# Logs
+*.log
+
+# Tests
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Scratch from the optimizer worker (created at runtime, never committed)
+/tmp/optimizer/

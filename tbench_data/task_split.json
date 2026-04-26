@@ -1,0 +1,22 @@
+{
+  "train": [
+    "fix-git",
+    "configure-git-webserver",
+    "git-leak-recovery",
+    "nginx-request-logging",
+    "count-dataset-tokens"
+  ],
+  "test": [
+    "fix-git",
+    "configure-git-webserver",
+    "git-leak-recovery",
+    "nginx-request-logging",
+    "count-dataset-tokens"
+  ],
+  "metadata": {
+    "created": "2026-04-26T11:45:00+00:00",
+    "total_tasks": 5,
+    "seed": 42,
+    "note": "Manually pre-created to skip the 89-task baseline run in prepare.py."
+  }
+}

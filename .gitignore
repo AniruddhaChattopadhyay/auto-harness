@@ -1,0 +1,27 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.env
+.DS_Store
+*.log
+
+# agent working directory (runtime state, not committed)
+workspace/
+workspace_backups/
+bird_data/
+
+# local coding agent config
+.claude/
+
+# local experiment config (created by prepare.py from template)
+experiment_config.yaml
+
+# build/data artifacts
+auto_harness.egg-info/
+
+# tau2 data (auto-cloned by prepare.py, not committed)
+tau2_data/
+
+# BIRD-Interact-ADK (auto-cloned by prepare.py, not committed)
+bird_interact_adk/
